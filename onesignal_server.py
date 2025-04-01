@@ -28,7 +28,7 @@ mcp = FastMCP("onesignal-server")
 logger.info("OneSignal MCP server initialized")
 
 # OneSignal API configuration
-ONESIGNAL_API_URL = "https://api.onesignal.com"
+ONESIGNAL_API_URL = "https://api.onesignal.com/api/v1"
 ONESIGNAL_ORG_API_KEY = os.getenv("ONESIGNAL_ORG_API_KEY", "")
 
 # Class to manage app configurations
@@ -44,16 +44,35 @@ class AppConfig:
 # Dictionary to store app configurations
 app_configs: Dict[str, AppConfig] = {}
 
-# Default app configuration (Mandible)
-default_app_id = os.getenv("ONESIGNAL_APP_ID", "")
-default_api_key = os.getenv("ONESIGNAL_API_KEY", "")
-if default_app_id and default_api_key:
-    app_configs["mandible"] = AppConfig(default_app_id, default_api_key, "Mandible")
+# Load app configurations from environment variables
+# Mandible app configuration
+mandible_app_id = os.getenv("ONESIGNAL_MANDIBLE_APP_ID", "") or os.getenv("ONESIGNAL_APP_ID", "")
+mandible_api_key = os.getenv("ONESIGNAL_MANDIBLE_API_KEY", "") or os.getenv("ONESIGNAL_API_KEY", "")
+if mandible_app_id and mandible_api_key:
+    app_configs["mandible"] = AppConfig(mandible_app_id, mandible_api_key, "Mandible")
     current_app_key = "mandible"
-    logger.info(f"Default app 'mandible' configured with ID: {default_app_id}")
-else:
-    current_app_key = None
-    logger.warning("No default app configured. Use add_app to add an app configuration.")
+    logger.info(f"Mandible app configured with ID: {mandible_app_id}")
+
+# Weird Brains app configuration
+weirdbrains_app_id = os.getenv("ONESIGNAL_WEIRDBRAINS_APP_ID", "")
+weirdbrains_api_key = os.getenv("ONESIGNAL_WEIRDBRAINS_API_KEY", "")
+if weirdbrains_app_id and weirdbrains_api_key:
+    app_configs["weirdbrains"] = AppConfig(weirdbrains_app_id, weirdbrains_api_key, "Weird Brains")
+    if not current_app_key:
+        current_app_key = "weirdbrains"
+    logger.info(f"Weird Brains app configured with ID: {weirdbrains_app_id}")
+
+# Fallback for default app configuration
+if not app_configs:
+    default_app_id = os.getenv("ONESIGNAL_APP_ID", "")
+    default_api_key = os.getenv("ONESIGNAL_API_KEY", "")
+    if default_app_id and default_api_key:
+        app_configs["default"] = AppConfig(default_app_id, default_api_key, "Default App")
+        current_app_key = "default"
+        logger.info(f"Default app configured with ID: {default_app_id}")
+    else:
+        current_app_key = None
+        logger.warning("No app configurations found. Use add_app to add an app configuration.")
 
 # Function to add a new app configuration
 def add_app_config(key: str, app_id: str, api_key: str, name: str = None) -> None:
@@ -97,13 +116,37 @@ def get_current_app() -> Optional[AppConfig]:
         return app_configs[current_app_key]
     return None
 
+# Helper function to determine whether to use Organization API Key
+def requires_org_api_key(endpoint: str) -> bool:
+    """Determine if an endpoint requires the Organization API Key instead of a REST API Key.
+    
+    Args:
+        endpoint: The API endpoint path
+        
+    Returns:
+        True if the endpoint requires Organization API Key, False otherwise
+    """
+    # Organization-level endpoints that require Organization API Key
+    org_level_endpoints = [
+        "apps",                    # Managing apps
+        "players/csv_export",      # Export users
+        "notifications/csv_export"  # Export notifications
+    ]
+    
+    # Check if endpoint starts with or matches any org-level endpoint
+    for org_endpoint in org_level_endpoints:
+        if endpoint == org_endpoint or endpoint.startswith(f"{org_endpoint}/"):
+            return True
+    
+    return False
+
 # Helper function for OneSignal API requests
 async def make_onesignal_request(
     endpoint: str, 
     method: str = "GET", 
     data: Dict[str, Any] = None, 
     params: Dict[str, Any] = None, 
-    use_org_key: bool = False,
+    use_org_key: bool = None,
     app_key: str = None
 ) -> Dict[str, Any]:
     """Make a request to the OneSignal API with proper authentication.
@@ -114,6 +157,7 @@ async def make_onesignal_request(
         data: Request body for POST/PUT requests
         params: Query parameters for GET requests
         use_org_key: Whether to use the organization API key instead of the REST API key
+                     If None, will be automatically determined based on the endpoint
         app_key: The key of the app configuration to use (uses current app if None)
         
     Returns:
@@ -123,6 +167,10 @@ async def make_onesignal_request(
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
+    
+    # If use_org_key is not explicitly specified, determine it based on the endpoint
+    if use_org_key is None:
+        use_org_key = requires_org_api_key(endpoint)
     
     # Determine which app configuration to use
     app_config = None
@@ -137,13 +185,13 @@ async def make_onesignal_request(
             logger.error(error_msg)
             return {"error": error_msg}
         
-        headers["Authorization"] = f"Key {app_config.api_key}"
+        headers["Authorization"] = f"Basic {app_config.api_key}"
     else:
         if not ONESIGNAL_ORG_API_KEY:
             error_msg = "Organization API Key not configured. Set the ONESIGNAL_ORG_API_KEY environment variable."
             logger.error(error_msg)
             return {"error": error_msg}
-        headers["Authorization"] = f"Key {ONESIGNAL_ORG_API_KEY}"
+        headers["Authorization"] = f"Basic {ONESIGNAL_ORG_API_KEY}"
     
     url = f"{ONESIGNAL_API_URL}/{endpoint}"
     
@@ -160,6 +208,7 @@ async def make_onesignal_request(
     
     try:
         logger.debug(f"Making {method} request to {url}")
+        logger.debug(f"Using {'Organization API Key' if use_org_key else 'App REST API Key'}")
         if method == "GET":
             response = requests.get(url, headers=headers, params=params, timeout=30)
         elif method == "POST":
@@ -342,7 +391,7 @@ async def switch_app(key: str) -> str:
 # === Message Management Tools ===
 
 @mcp.tool()
-async def send_notification(title: str, message: str, segment: str = "Subscribed Users", target_channel: str = "push") -> str:
+async def send_notification(title: str, message: str, segment: str = "Subscribed Users", target_channel: str = "push", data: Dict[str, Any] = None):
     """Send a new push notification through OneSignal.
     
     Args:
@@ -350,21 +399,27 @@ async def send_notification(title: str, message: str, segment: str = "Subscribed
         message: Notification message content
         segment: Target audience segment (default: "Subscribed Users")
         target_channel: Channel type (push, email, sms) (default: "push")
+        data: Additional data to include with the notification (optional)
     """
-    data = {
-        "app_id": get_current_app().app_id,
-        "headings": {"en": title},
-        "contents": {"en": message},
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    notification_data = {
+        "app_id": app_config.app_id,
+        "target_channel": target_channel,
         "included_segments": [segment],
-        "target_channel": target_channel
+        "contents": {"en": message},
+        "headings": {"en": title}
     }
     
-    result = await make_onesignal_request("notifications", method="POST", data=data)
+    if data:
+        notification_data["data"] = data
     
-    if "error" in result:
-        return f"Error sending notification: {result['error']}"
+    # This endpoint uses app-specific REST API Key
+    result = await make_onesignal_request("notifications", method="POST", data=notification_data, use_org_key=False)
     
-    return f"Notification sent successfully!\nID: {result.get('id')}\nRecipients: {result.get('recipients')}"
+    return result
 
 @mcp.tool()
 async def view_messages(limit: int = 20, offset: int = 0) -> str:
@@ -374,45 +429,36 @@ async def view_messages(limit: int = 20, offset: int = 0) -> str:
         limit: Maximum number of messages to return (default: 20, max: 50)
         offset: Result offset for pagination (default: 0)
     """
-    params = {
-        "app_id": get_current_app().app_id, 
-        "limit": min(limit, 50), 
-        "offset": offset
-    }
+    app_config = get_current_app()
+    if not app_config:
+        return "No app currently selected. Use switch_app to select an app."
     
-    result = await make_onesignal_request("notifications", params=params)
+    params = {"limit": min(limit, 50), "offset": offset}
+    
+    # This endpoint uses app-specific REST API Key
+    result = await make_onesignal_request("notifications", method="GET", params=params, use_org_key=False)
     
     if "error" in result:
-        return f"Error fetching messages: {result['error']}"
+        return f"Error retrieving messages: {result['error']}"
     
-    if not result.get("notifications"):
+    notifications = result.get("notifications", [])
+    if not notifications:
         return "No messages found."
     
-    messages_info = []
-    for msg in result.get("notifications", []):
-        heading = msg.get("headings", {}).get("en", "No heading") if isinstance(msg.get("headings"), dict) else "No heading"
-        content = msg.get("contents", {}).get("en", "No content") if isinstance(msg.get("contents"), dict) else "No content"
-        
-        messages_info.append(
-            f"ID: {msg.get('id')}\n"
-            f"Title: {heading}\n"
-            f"Message: {content}\n"
-            f"Created: {msg.get('created_at')}\n"
-            f"Sent: {msg.get('completed_at')}\n"
-            f"Successful: {msg.get('successful', 0)}\n"
-            f"Failed: {msg.get('failed', 0)}\n"
-            f"Remaining: {msg.get('remaining', 0)}\n"
-            f"Platform: {msg.get('platform')}"
-        )
+    output = "Messages:\n\n"
     
-    total = result.get("total_count", 0)
-    response = f"Messages (showing {len(messages_info)} of {total}):\n\n" + "\n\n".join(messages_info)
+    for notification in notifications:
+        output += f"ID: {notification.get('id')}\n"
+        output += f"Title: {notification.get('headings', {}).get('en', 'No Title')}\n"
+        output += f"Message: {notification.get('contents', {}).get('en', 'No Content')}\n"
+        output += f"Created: {notification.get('created_at')}\n"
+        output += f"Sent: {notification.get('sent_at')}\n"
+        output += f"Status: {notification.get('completed_at', 'Pending')}\n"
+        output += f"Successful: {notification.get('successful', 0)}\n"
+        output += f"Failed: {notification.get('failed', 0)}\n"
+        output += f"Remaining: {notification.get('remaining', 0)}\n\n"
     
-    # Add pagination info
-    if total > limit + offset:
-        response += f"\n\nThere are more messages available. Use offset={offset + limit} to view the next page."
-    
-    return response
+    return output
 
 @mcp.tool()
 async def view_message_details(message_id: str) -> str:
@@ -421,33 +467,30 @@ async def view_message_details(message_id: str) -> str:
     Args:
         message_id: The ID of the message to retrieve details for
     """
-    params = {"app_id": get_current_app().app_id}
-    result = await make_onesignal_request(f"notifications/{message_id}", params=params)
+    app_config = get_current_app()
+    if not app_config:
+        return "No app currently selected. Use switch_app to select an app."
+    
+    # This endpoint uses app-specific REST API Key
+    result = await make_onesignal_request(f"notifications/{message_id}", method="GET", use_org_key=False)
     
     if "error" in result:
-        return f"Error fetching message details: {result['error']}"
+        return f"Error retrieving message details: {result['error']}"
     
-    # Format the message details in a readable way
-    heading = result.get("headings", {}).get("en", "No heading") if isinstance(result.get("headings"), dict) else "No heading"
-    content = result.get("contents", {}).get("en", "No content") if isinstance(result.get("contents"), dict) else "No content"
+    output = f"ID: {result.get('id')}\n"
+    output += f"App ID: {result.get('app_id')}\n"
+    output += f"Title: {result.get('headings', {}).get('en', 'No Title')}\n"
+    output += f"Message: {result.get('contents', {}).get('en', 'No Content')}\n"
+    output += f"URL: {result.get('url')}\n"
+    output += f"Created: {result.get('created_at')}\n"
+    output += f"Sent: {result.get('sent_at')}\n"
+    output += f"Completed: {result.get('completed_at')}\n"
+    output += f"Successful: {result.get('successful')}\n"
+    output += f"Failed: {result.get('failed')}\n"
+    output += f"Remaining: {result.get('remaining')}\n"
+    output += f"Platform Delivery Stats: {result.get('platform_delivery_stats')}\n"
     
-    details = [
-        f"ID: {result.get('id')}",
-        f"Title: {heading}",
-        f"Message: {content}",
-        f"Created: {result.get('created_at')}",
-        f"Sent: {result.get('completed_at')}",
-        f"Channel: {result.get('channel')}",
-        f"Target: {result.get('target_channel')}",
-        f"Successful: {result.get('successful', 0)}",
-        f"Failed: {result.get('failed', 0)}",
-        f"Remaining: {result.get('remaining', 0)}",
-        f"Platform: {result.get('platform')}",
-        f"Segments: {', '.join(result.get('included_segments', []))}",
-        f"Data: {json.dumps(result.get('data', {}), indent=2)}"
-    ]
-    
-    return "\n".join(details)
+    return output
 
 @mcp.tool()
 async def cancel_message(message_id: str) -> str:
@@ -456,13 +499,17 @@ async def cancel_message(message_id: str) -> str:
     Args:
         message_id: The ID of the message to cancel
     """
-    params = {"app_id": get_current_app().app_id}
-    result = await make_onesignal_request(f"notifications/{message_id}", method="DELETE", params=params)
+    app_config = get_current_app()
+    if not app_config:
+        return "No app currently selected. Use switch_app to select an app."
+    
+    # This endpoint uses app-specific REST API Key
+    result = await make_onesignal_request(f"notifications/{message_id}", method="DELETE", use_org_key=False)
     
     if "error" in result:
         return f"Error canceling message: {result['error']}"
     
-    return f"Message {message_id} successfully canceled. {result.get('success', 0)} notifications were stopped from sending."
+    return "Message canceled successfully."
 
 # === Device Management Tools ===
 
@@ -474,8 +521,12 @@ async def view_devices(limit: int = 20, offset: int = 0) -> str:
         limit: Maximum number of devices to return (default: 20, max: 200)
         offset: Result offset for pagination (default: 0)
     """
+    app_config = get_current_app()
+    if not app_config:
+        return "No app currently selected. Use switch_app to select an app."
+    
     params = {
-        "app_id": get_current_app().app_id, 
+        "app_id": app_config.app_id, 
         "limit": min(limit, 200), 
         "offset": offset
     }
@@ -510,7 +561,11 @@ async def view_device_details(device_id: str) -> str:
     Args:
         device_id: The ID of the device to retrieve details for
     """
-    params = {"app_id": get_current_app().app_id}
+    app_config = get_current_app()
+    if not app_config:
+        return "No app currently selected. Use switch_app to select an app."
+    
+    params = {"app_id": app_config.app_id}
     result = await make_onesignal_request(f"players/{device_id}", method="GET", params=params)
     
     if "error" in result:
@@ -540,29 +595,30 @@ async def view_device_details(device_id: str) -> str:
 @mcp.tool()
 async def view_segments() -> str:
     """List all segments available in your OneSignal app."""
-    endpoint = f"apps/{get_current_app().app_id}/segments"
-    result = await make_onesignal_request(endpoint, method="GET")
+    app_config = get_current_app()
+    if not app_config:
+        return "No app currently selected. Use switch_app to select an app."
+    
+    # This endpoint uses app-specific REST API Key
+    result = await make_onesignal_request("segments", method="GET", use_org_key=False)
     
     if "error" in result:
-        return f"Error fetching segments: {result['error']}"
+        return f"Error retrieving segments: {result['error']}"
     
-    segments = result.get("segments", [])
-    
-    if not segments:
+    if not result:
         return "No segments found."
     
-    segments_info = []
-    for segment in segments:
-        segments_info.append(
-            f"ID: {segment.get('id')}\n"
-            f"Name: {segment.get('name')}\n"
-            f"Created: {segment.get('created_at')}\n"
-            f"Updated: {segment.get('updated_at')}\n"
-            f"Active: {segment.get('is_active', False)}\n"
-            f"Read Only: {segment.get('read_only', False)}"
-        )
+    output = "Segments:\n\n"
     
-    return "Segments:\n\n" + "\n\n".join(segments_info)
+    for segment in result:
+        output += f"ID: {segment.get('id')}\n"
+        output += f"Name: {segment.get('name')}\n"
+        output += f"Created: {segment.get('created_at')}\n"
+        output += f"Updated: {segment.get('updated_at')}\n"
+        output += f"Active: {segment.get('is_active', False)}\n"
+        output += f"Read Only: {segment.get('read_only', False)}\n\n"
+    
+    return output
 
 @mcp.tool()
 async def create_segment(name: str, filters: str) -> str:
@@ -611,27 +667,30 @@ async def delete_segment(segment_id: str) -> str:
 @mcp.tool()
 async def view_templates() -> str:
     """List all templates available in your OneSignal app."""
-    params = {"app_id": get_current_app().app_id}
-    result = await make_onesignal_request("templates", method="GET", params=params)
+    app_config = get_current_app()
+    if not app_config:
+        return "No app currently selected. Use switch_app to select an app."
+    
+    # This endpoint uses app-specific REST API Key
+    result = await make_onesignal_request("templates", method="GET", use_org_key=False)
     
     if "error" in result:
-        return f"Error fetching templates: {result['error']}"
+        return f"Error retrieving templates: {result['error']}"
     
     templates = result.get("templates", [])
     
     if not templates:
         return "No templates found."
     
-    templates_info = []
-    for template in templates:
-        templates_info.append(
-            f"ID: {template.get('id')}\n"
-            f"Name: {template.get('name')}\n"
-            f"Platform: {template.get('platform')}\n"
-            f"Created: {template.get('created_at')}"
-        )
+    output = "Templates:\n\n"
     
-    return "Templates:\n\n" + "\n\n".join(templates_info)
+    for template in templates:
+        output += f"ID: {template.get('id')}\n"
+        output += f"Name: {template.get('name')}\n"
+        output += f"Created: {template.get('created_at')}\n"
+        output += f"Updated: {template.get('updated_at')}\n\n"
+    
+    return output
 
 @mcp.tool()
 async def view_template_details(template_id: str) -> str:
@@ -687,9 +746,35 @@ async def create_template(name: str, title: str, message: str) -> str:
 # === App Information Tools ===
 
 @mcp.tool()
+async def view_app_details() -> str:
+    """Get detailed information about the configured OneSignal app."""
+    app_config = get_current_app()
+    if not app_config:
+        return "No app currently selected. Use switch_app to select an app."
+    
+    # This endpoint requires the app_id in the URL and Organization API Key
+    result = await make_onesignal_request(f"apps/{app_config.app_id}", method="GET", use_org_key=True)
+    
+    if "error" in result:
+        return f"Error retrieving app details: {result['error']}"
+    
+    output = f"ID: {result.get('id')}\n"
+    output += f"Name: {result.get('name')}\n"
+    output += f"Created: {result.get('created_at')}\n"
+    output += f"Updated: {result.get('updated_at')}\n"
+    output += f"GCM: {'Configured' if result.get('gcm_key') else 'Not Configured'}\n"
+    output += f"APNS: {'Configured' if result.get('apns_env') else 'Not Configured'}\n"
+    output += f"Chrome: {'Configured' if result.get('chrome_web_key') else 'Not Configured'}\n"
+    output += f"Safari: {'Configured' if result.get('safari_site_origin') else 'Not Configured'}\n"
+    output += f"Email: {'Configured' if result.get('email_marketing') else 'Not Configured'}\n"
+    output += f"SMS: {'Configured' if result.get('sms_marketing') else 'Not Configured'}\n"
+    
+    return output
+
+@mcp.tool()
 async def view_apps() -> str:
     """List all OneSignal applications for the organization (requires Organization API Key)."""
-    result = await make_onesignal_request("apps", use_org_key=True)
+    result = await make_onesignal_request("apps", method="GET", use_org_key=True)
     
     if "error" in result:
         if "401" in str(result["error"]) or "403" in str(result["error"]):
@@ -712,30 +797,6 @@ async def view_apps() -> str:
         )
     
     return "Applications:\n\n" + "\n\n".join(apps_info)
-
-@mcp.tool()
-async def view_app_details() -> str:
-    """Get detailed information about the configured OneSignal app."""
-    result = await make_onesignal_request(f"apps/{get_current_app().app_id}")
-    
-    if "error" in result:
-        return f"Error fetching app details: {result['error']}"
-    
-    # Format the app details in a readable way
-    details = [
-        f"ID: {result.get('id')}",
-        f"Name: {result.get('name')}",
-        f"Created: {result.get('created_at')}",
-        f"Updated: {result.get('updated_at')}",
-        f"GCM: {'Configured' if result.get('gcm_key') else 'Not Configured'}",
-        f"APNS: {'Configured' if result.get('apns_env') else 'Not Configured'}",
-        f"Chrome: {'Configured' if result.get('chrome_web_origin') else 'Not Configured'}",
-        f"Safari: {'Configured' if result.get('safari_site_origin') else 'Not Configured'}",
-        f"Email: {'Configured' if result.get('additional_data_is_root_payload') else 'Not Configured'}",
-        f"SMS: {'Configured' if result.get('sms_auth_fields') else 'Not Configured'}"
-    ]
-    
-    return "\n".join(details)
 
 # === Organization-level Tools ===
 
