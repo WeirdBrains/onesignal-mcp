@@ -11,7 +11,7 @@ __version__ = "1.0.0"
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO, # Default level, will be overridden by env var if set
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler()
@@ -23,9 +23,19 @@ logger = logging.getLogger("onesignal-mcp")
 load_dotenv()
 logger.info("Environment variables loaded")
 
-# Initialize the MCP server
-mcp = FastMCP("onesignal-server")
-logger.info("OneSignal MCP server initialized")
+# Get log level from environment, default to INFO, and ensure it's uppercase
+log_level_str = os.getenv("LOG_LEVEL", "INFO").upper()
+valid_log_levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+if log_level_str not in valid_log_levels:
+    logger.warning(f"Invalid LOG_LEVEL '{log_level_str}' found in environment. Using INFO instead.")
+    log_level_str = "INFO"
+
+# Apply the validated log level
+logger.setLevel(log_level_str)
+
+# Initialize the MCP server, passing the validated log level
+mcp = FastMCP("onesignal-server", settings={"log_level": log_level_str})
+logger.info(f"OneSignal MCP server initialized with log level: {log_level_str}")
 
 # OneSignal API configuration
 ONESIGNAL_API_URL = "https://api.onesignal.com/api/v1"
@@ -114,6 +124,7 @@ def get_current_app() -> Optional[AppConfig]:
     """
     if current_app_key and current_app_key in app_configs:
         return app_configs[current_app_key]
+    logger.warning("No current app is set. Use switch_app(key) to select an app.")
     return None
 
 # Helper function to determine whether to use Organization API Key
@@ -291,7 +302,7 @@ async def list_apps() -> str:
 
 @mcp.tool()
 async def add_app(key: str, app_id: str, api_key: str, name: str = None) -> str:
-    """Add a new OneSignal app configuration.
+    """Add a new OneSignal app configuration locally.
     
     Args:
         key: Unique identifier for this app configuration
@@ -315,11 +326,11 @@ async def add_app(key: str, app_id: str, api_key: str, name: str = None) -> str:
     return f"Successfully added app '{key}' with name '{name or key}'."
 
 @mcp.tool()
-async def update_app(key: str, app_id: str = None, api_key: str = None, name: str = None) -> str:
-    """Update an existing OneSignal app configuration.
+async def update_local_app_config(key: str, app_id: str = None, api_key: str = None, name: str = None) -> str:
+    """Update an existing local OneSignal app configuration.
     
     Args:
-        key: The key of the app configuration to update
+        key: The key of the app configuration to update locally
         app_id: New OneSignal App ID (optional)
         api_key: New OneSignal REST API Key (optional)
         name: New display name for the app (optional)
@@ -348,10 +359,10 @@ async def update_app(key: str, app_id: str = None, api_key: str = None, name: st
 
 @mcp.tool()
 async def remove_app(key: str) -> str:
-    """Remove an OneSignal app configuration.
+    """Remove a local OneSignal app configuration.
     
     Args:
-        key: The key of the app configuration to remove
+        key: The key of the app configuration to remove locally
     """
     if key not in app_configs:
         return f"Error: App key '{key}' not found."
@@ -391,27 +402,38 @@ async def switch_app(key: str) -> str:
 # === Message Management Tools ===
 
 @mcp.tool()
-async def send_notification(title: str, message: str, segment: str = "Subscribed Users", target_channel: str = "push", data: Dict[str, Any] = None):
+async def send_push_notification(title: str, message: str, segments: List[str] = None, include_player_ids: List[str] = None, external_ids: List[str] = None, data: Dict[str, Any] = None) -> Dict[str, Any]:
     """Send a new push notification through OneSignal.
     
     Args:
-        title: Notification title
-        message: Notification message content
-        segment: Target audience segment (default: "Subscribed Users")
-        target_channel: Channel type (push, email, sms) (default: "push")
-        data: Additional data to include with the notification (optional)
+        title: Notification title.
+        message: Notification message content.
+        segments: List of segments to include (e.g., ["Subscribed Users"]).
+        include_player_ids: List of specific player IDs to target.
+        external_ids: List of external user IDs to target.
+        data: Additional data to include with the notification (optional).
     """
     app_config = get_current_app()
     if not app_config:
         return {"error": "No app currently selected. Use switch_app to select an app."}
     
+    if not segments and not include_player_ids and not external_ids:
+        segments = ["Subscribed Users"] # Default if no target specified
+    
     notification_data = {
         "app_id": app_config.app_id,
-        "target_channel": target_channel,
-        "included_segments": [segment],
         "contents": {"en": message},
-        "headings": {"en": title}
+        "headings": {"en": title},
+        "target_channel": "push"
     }
+    
+    if segments:
+        notification_data["included_segments"] = segments
+    if include_player_ids:
+        notification_data["include_player_ids"] = include_player_ids
+    if external_ids:
+        # Assuming make_onesignal_request handles converting list to JSON
+        notification_data["include_external_user_ids"] = external_ids
     
     if data:
         notification_data["data"] = data
@@ -422,46 +444,30 @@ async def send_notification(title: str, message: str, segment: str = "Subscribed
     return result
 
 @mcp.tool()
-async def view_messages(limit: int = 20, offset: int = 0) -> str:
+async def view_messages(limit: int = 20, offset: int = 0, kind: int = None) -> Dict[str, Any]:
     """View recent messages sent through OneSignal.
     
     Args:
         limit: Maximum number of messages to return (default: 20, max: 50)
         offset: Result offset for pagination (default: 0)
+        kind: Filter by message type (0=Dashboard, 1=API, 3=Automated) (optional)
     """
     app_config = get_current_app()
     if not app_config:
-        return "No app currently selected. Use switch_app to select an app."
+        return {"error": "No app currently selected. Use switch_app to select an app."}
     
     params = {"limit": min(limit, 50), "offset": offset}
+    if kind is not None:
+        params["kind"] = kind
     
     # This endpoint uses app-specific REST API Key
     result = await make_onesignal_request("notifications", method="GET", params=params, use_org_key=False)
     
-    if "error" in result:
-        return f"Error retrieving messages: {result['error']}"
-    
-    notifications = result.get("notifications", [])
-    if not notifications:
-        return "No messages found."
-    
-    output = "Messages:\n\n"
-    
-    for notification in notifications:
-        output += f"ID: {notification.get('id')}\n"
-        output += f"Title: {notification.get('headings', {}).get('en', 'No Title')}\n"
-        output += f"Message: {notification.get('contents', {}).get('en', 'No Content')}\n"
-        output += f"Created: {notification.get('created_at')}\n"
-        output += f"Sent: {notification.get('sent_at')}\n"
-        output += f"Status: {notification.get('completed_at', 'Pending')}\n"
-        output += f"Successful: {notification.get('successful', 0)}\n"
-        output += f"Failed: {notification.get('failed', 0)}\n"
-        output += f"Remaining: {notification.get('remaining', 0)}\n\n"
-    
-    return output
+    # Return the raw JSON result for flexibility
+    return result
 
 @mcp.tool()
-async def view_message_details(message_id: str) -> str:
+async def view_message_details(message_id: str) -> Dict[str, Any]:
     """Get detailed information about a specific message.
     
     Args:
@@ -469,31 +475,38 @@ async def view_message_details(message_id: str) -> str:
     """
     app_config = get_current_app()
     if not app_config:
-        return "No app currently selected. Use switch_app to select an app."
+        return {"error": "No app currently selected. Use switch_app to select an app."}
     
     # This endpoint uses app-specific REST API Key
     result = await make_onesignal_request(f"notifications/{message_id}", method="GET", use_org_key=False)
     
-    if "error" in result:
-        return f"Error retrieving message details: {result['error']}"
-    
-    output = f"ID: {result.get('id')}\n"
-    output += f"App ID: {result.get('app_id')}\n"
-    output += f"Title: {result.get('headings', {}).get('en', 'No Title')}\n"
-    output += f"Message: {result.get('contents', {}).get('en', 'No Content')}\n"
-    output += f"URL: {result.get('url')}\n"
-    output += f"Created: {result.get('created_at')}\n"
-    output += f"Sent: {result.get('sent_at')}\n"
-    output += f"Completed: {result.get('completed_at')}\n"
-    output += f"Successful: {result.get('successful')}\n"
-    output += f"Failed: {result.get('failed')}\n"
-    output += f"Remaining: {result.get('remaining')}\n"
-    output += f"Platform Delivery Stats: {result.get('platform_delivery_stats')}\n"
-    
-    return output
+    # Return the raw JSON result
+    return result
 
 @mcp.tool()
-async def cancel_message(message_id: str) -> str:
+async def view_message_history(message_id: str, event: str) -> Dict[str, Any]:
+    """View the history / recipients of a message based on events.
+    
+    Args:
+        message_id: The ID of the message.
+        event: The event type to track (e.g., 'sent', 'clicked').
+    """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    data = {
+        "app_id": app_config.app_id,
+        "events": event,
+        "email": get_current_app().name + "-history@example.com" # Requires an email to send the CSV report
+    }
+    
+    # Endpoint uses REST API Key
+    result = await make_onesignal_request(f"notifications/{message_id}/history", method="POST", data=data, use_org_key=False)
+    return result
+
+@mcp.tool()
+async def cancel_message(message_id: str) -> Dict[str, Any]:
     """Cancel a scheduled message that hasn't been delivered yet.
     
     Args:
@@ -501,15 +514,12 @@ async def cancel_message(message_id: str) -> str:
     """
     app_config = get_current_app()
     if not app_config:
-        return "No app currently selected. Use switch_app to select an app."
+        return {"error": "No app currently selected. Use switch_app to select an app."}
     
     # This endpoint uses app-specific REST API Key
     result = await make_onesignal_request(f"notifications/{message_id}", method="DELETE", use_org_key=False)
     
-    if "error" in result:
-        return f"Error canceling message: {result['error']}"
-    
-    return "Message canceled successfully."
+    return result
 
 # === Device Management Tools ===
 
@@ -914,6 +924,240 @@ async def create_app_api_key(app_id: str, name: str) -> str:
     )
     
     return key_details
+
+# === User Management Tools ===
+
+@mcp.tool()
+async def create_user(name: str = None, email: str = None, external_id: str = None, tags: Dict[str, str] = None) -> Dict[str, Any]:
+    """Create a new user in OneSignal.
+    
+    Args:
+        name: User's name (optional)
+        email: User's email address (optional)
+        external_id: External user ID for identification (optional)
+        tags: Additional user tags/properties (optional)
+    """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    data = {}
+    if name:
+        data["name"] = name
+    if email:
+        data["email"] = email
+    if external_id:
+        data["external_user_id"] = external_id
+    if tags:
+        data["tags"] = tags
+    
+    result = await make_onesignal_request("users", method="POST", data=data)
+    return result
+
+@mcp.tool()
+async def view_user(user_id: str) -> Dict[str, Any]:
+    """Get detailed information about a specific user.
+    
+    Args:
+        user_id: The OneSignal User ID to retrieve details for
+    """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    result = await make_onesignal_request(f"users/{user_id}", method="GET")
+    return result
+
+@mcp.tool()
+async def update_user(user_id: str, name: str = None, email: str = None, tags: Dict[str, str] = None) -> Dict[str, Any]:
+    """Update an existing user's information.
+    
+    Args:
+        user_id: The OneSignal User ID to update
+        name: New name for the user (optional)
+        email: New email address (optional)
+        tags: New or updated tags/properties (optional)
+    """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    data = {}
+    if name:
+        data["name"] = name
+    if email:
+        data["email"] = email
+    if tags:
+        data["tags"] = tags
+    
+    if not data:
+        return {"error": "No update parameters provided"}
+    
+    result = await make_onesignal_request(f"users/{user_id}", method="PATCH", data=data)
+    return result
+
+@mcp.tool()
+async def delete_user(user_id: str) -> Dict[str, Any]:
+    """Delete a user and all their subscriptions.
+    
+    Args:
+        user_id: The OneSignal User ID to delete
+    """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    result = await make_onesignal_request(f"users/{user_id}", method="DELETE")
+    return result
+
+@mcp.tool()
+async def view_user_identity(user_id: str) -> Dict[str, Any]:
+    """Get user identity information.
+    
+    Args:
+        user_id: The OneSignal User ID to retrieve identity for
+    """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    result = await make_onesignal_request(f"users/{user_id}/identity", method="GET")
+    return result
+
+@mcp.tool()
+async def create_or_update_alias(user_id: str, alias_label: str, alias_id: str) -> Dict[str, Any]:
+    """Create or update a user alias.
+    
+    Args:
+        user_id: The OneSignal User ID
+        alias_label: The type/label of the alias (e.g., "email", "phone", "external")
+        alias_id: The alias identifier value
+    """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    data = {
+        "alias": {
+            alias_label: alias_id
+        }
+    }
+    
+    result = await make_onesignal_request(f"users/{user_id}/identity", method="PATCH", data=data)
+    return result
+
+@mcp.tool()
+async def delete_alias(user_id: str, alias_label: str) -> Dict[str, Any]:
+    """Delete a user alias.
+    
+    Args:
+        user_id: The OneSignal User ID
+        alias_label: The type/label of the alias to delete
+    """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    result = await make_onesignal_request(f"users/{user_id}/identity/{alias_label}", method="DELETE")
+    return result
+
+# === Subscription Management Tools ===
+
+@mcp.tool()
+async def create_subscription(user_id: str, subscription_type: str, identifier: str) -> Dict[str, Any]:
+    """Create a new subscription for a user.
+    
+    Args:
+        user_id: The OneSignal User ID
+        subscription_type: Type of subscription ("email", "sms", "push")
+        identifier: Email address or phone number for the subscription
+    """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    data = {
+        "subscription": {
+            "type": subscription_type,
+            "identifier": identifier
+        }
+    }
+    
+    result = await make_onesignal_request(f"users/{user_id}/subscriptions", method="POST", data=data)
+    return result
+
+@mcp.tool()
+async def update_subscription(user_id: str, subscription_id: str, enabled: bool = None) -> Dict[str, Any]:
+    """Update a user's subscription.
+    
+    Args:
+        user_id: The OneSignal User ID
+        subscription_id: The ID of the subscription to update
+        enabled: Whether the subscription should be enabled or disabled (optional)
+    """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    data = {}
+    if enabled is not None:
+        data["enabled"] = enabled
+    
+    result = await make_onesignal_request(f"users/{user_id}/subscriptions/{subscription_id}", method="PATCH", data=data)
+    return result
+
+@mcp.tool()
+async def delete_subscription(user_id: str, subscription_id: str) -> Dict[str, Any]:
+    """Delete a user's subscription.
+    
+    Args:
+        user_id: The OneSignal User ID
+        subscription_id: The ID of the subscription to delete
+    """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    result = await make_onesignal_request(f"users/{user_id}/subscriptions/{subscription_id}", method="DELETE")
+    return result
+
+@mcp.tool()
+async def transfer_subscription(user_id: str, subscription_id: str, new_user_id: str) -> Dict[str, Any]:
+    """Transfer a subscription from one user to another.
+    
+    Args:
+        user_id: The current OneSignal User ID
+        subscription_id: The ID of the subscription to transfer
+        new_user_id: The OneSignal User ID to transfer the subscription to
+    """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    data = {
+        "new_user_id": new_user_id
+    }
+    
+    result = await make_onesignal_request(f"users/{user_id}/subscriptions/{subscription_id}/transfer", method="PATCH", data=data)
+    return result
+
+@mcp.tool()
+async def unsubscribe_email(token: str) -> Dict[str, Any]:
+    """Unsubscribe an email subscription using an unsubscribe token.
+    
+    Args:
+        token: The unsubscribe token from the email
+    """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    data = {
+        "token": token
+    }
+    
+    result = await make_onesignal_request("email/unsubscribe", method="POST", data=data)
+    return result
 
 # Run the server
 if __name__ == "__main__":
