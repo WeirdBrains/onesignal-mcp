@@ -1,5 +1,6 @@
 import os
 import json
+import base64
 import requests
 import logging
 from typing import List, Dict, Any, Optional, Union
@@ -34,7 +35,7 @@ if log_level_str not in valid_log_levels:
 logger.setLevel(log_level_str)
 
 # Initialize the MCP server, passing the validated log level
-mcp = FastMCP("onesignal-server", settings={"log_level": log_level_str})
+mcp = FastMCP("onesignal-server", log_level=log_level_str)
 logger.info(f"OneSignal MCP server initialized with log level: {log_level_str}")
 
 # OneSignal API configuration
@@ -55,13 +56,13 @@ class AppConfig:
 app_configs: Dict[str, AppConfig] = {}
 
 # Load app configurations from environment variables
-# Mandible app configuration
-mandible_app_id = os.getenv("ONESIGNAL_MANDIBLE_APP_ID", "") or os.getenv("ONESIGNAL_APP_ID", "")
-mandible_api_key = os.getenv("ONESIGNAL_MANDIBLE_API_KEY", "") or os.getenv("ONESIGNAL_API_KEY", "")
-if mandible_app_id and mandible_api_key:
-    app_configs["mandible"] = AppConfig(mandible_app_id, mandible_api_key, "Mandible")
-    current_app_key = "mandible"
-    logger.info(f"Mandible app configured with ID: {mandible_app_id}")
+# AIBookCraft app configuration
+aibookcraft_app_id = os.getenv("ONESIGNAL_AIBOOKCRAFT_APP_ID", "") or os.getenv("ONESIGNAL_APP_ID", "")
+aibookcraft_api_key = os.getenv("ONESIGNAL_AIBOOKCRAFT_API_KEY", "") or os.getenv("ONESIGNAL_API_KEY", "")
+if aibookcraft_app_id and aibookcraft_api_key:
+    app_configs["aibookcraft"] = AppConfig(aibookcraft_app_id, aibookcraft_api_key, "AIBookCraft")
+    current_app_key = "aibookcraft"
+    logger.info(f"AIBookCraft app configured with ID: {aibookcraft_app_id}")
 
 # Weird Brains app configuration
 weirdbrains_app_id = os.getenv("ONESIGNAL_WEIRDBRAINS_APP_ID", "")
@@ -140,7 +141,8 @@ def requires_org_api_key(endpoint: str) -> bool:
     # Organization-level endpoints that require Organization API Key
     org_level_endpoints = [
         "apps",                    # Managing apps
-        "notifications/csv_export"  # Export notifications
+        "notifications/csv_export",  # Export notifications
+        "players/csv_export"        # Export players/subscriptions
     ]
     
     # Check if endpoint starts with or matches any org-level endpoint
@@ -157,7 +159,8 @@ async def make_onesignal_request(
     data: Dict[str, Any] = None, 
     params: Dict[str, Any] = None, 
     use_org_key: bool = None,
-    app_key: str = None
+    app_key: str = None,
+    headers: Dict[str, str] = None
 ) -> Dict[str, Any]:
     """Make a request to the OneSignal API with proper authentication.
     
@@ -169,14 +172,19 @@ async def make_onesignal_request(
         use_org_key: Whether to use the organization API key instead of the REST API key
                      If None, will be automatically determined based on the endpoint
         app_key: The key of the app configuration to use (uses current app if None)
+        headers: Additional headers to include in the request (optional)
         
     Returns:
         API response as dictionary
     """
-    headers = {
+    request_headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
+    
+    # Merge additional headers if provided
+    if headers:
+        request_headers.update(headers)
     
     # If use_org_key is not explicitly specified, determine it based on the endpoint
     if use_org_key is None:
@@ -197,9 +205,11 @@ async def make_onesignal_request(
         
         # Check if it's a v2 API key
         if app_config.api_key.startswith("os_v2_"):
-            headers["Authorization"] = f"Key {app_config.api_key}"
+            request_headers["Authorization"] = f"Key {app_config.api_key}"
         else:
-            headers["Authorization"] = f"Basic {app_config.api_key}"
+            # Basic auth requires base64 encoding of "api_key:"
+            encoded_key = base64.b64encode(f"{app_config.api_key}:".encode()).decode()
+            request_headers["Authorization"] = f"Basic {encoded_key}"
     else:
         if not ONESIGNAL_ORG_API_KEY:
             error_msg = "Organization API Key not configured. Set the ONESIGNAL_ORG_API_KEY environment variable."
@@ -207,9 +217,11 @@ async def make_onesignal_request(
             return {"error": error_msg}
         # Check if it's a v2 API key
         if ONESIGNAL_ORG_API_KEY.startswith("os_v2_"):
-            headers["Authorization"] = f"Key {ONESIGNAL_ORG_API_KEY}"
+            request_headers["Authorization"] = f"Key {ONESIGNAL_ORG_API_KEY}"
         else:
-            headers["Authorization"] = f"Basic {ONESIGNAL_ORG_API_KEY}"
+            # Basic auth requires base64 encoding of "api_key:"
+            encoded_key = base64.b64encode(f"{ONESIGNAL_ORG_API_KEY}:".encode()).decode()
+            request_headers["Authorization"] = f"Basic {encoded_key}"
     
     url = f"{ONESIGNAL_API_URL}/{endpoint}"
     
@@ -217,43 +229,80 @@ async def make_onesignal_request(
     if not use_org_key and app_config:
         if params is None:
             params = {}
-        if "app_id" not in params and not endpoint.startswith("apps/"):
+        # For GET and DELETE requests, add app_id to query parameters
+        if "app_id" not in params and not endpoint.startswith("apps/") and method in ["GET", "DELETE"]:
             params["app_id"] = app_config.app_id
         
-        # For POST/PUT requests, add app_id to data if not already present
-        if data is not None and method in ["POST", "PUT"] and "app_id" not in data and not endpoint.startswith("apps/"):
+        # For POST/PUT/PATCH requests, add app_id to data if not already present
+        if data is not None and method in ["POST", "PUT", "PATCH"] and "app_id" not in data and not endpoint.startswith("apps/"):
             data["app_id"] = app_config.app_id
     
     try:
         logger.debug(f"Making {method} request to {url}")
         logger.debug(f"Using {'Organization API Key' if use_org_key else 'App REST API Key'}")
-        logger.debug(f"Authorization header type: {headers['Authorization'].split(' ')[0]}")
+        logger.debug(f"Authorization header type: {request_headers['Authorization'].split(' ')[0]}")
         if method == "GET":
-            response = requests.get(url, headers=headers, params=params, timeout=30)
+            response = requests.get(url, headers=request_headers, params=params, timeout=30)
         elif method == "POST":
-            response = requests.post(url, headers=headers, json=data, timeout=30)
+            response = requests.post(url, headers=request_headers, json=data, timeout=30)
         elif method == "PUT":
-            response = requests.put(url, headers=headers, json=data, timeout=30)
+            response = requests.put(url, headers=request_headers, json=data, timeout=30)
         elif method == "DELETE":
-            response = requests.delete(url, headers=headers, timeout=30)
+            response = requests.delete(url, headers=request_headers, params=params, timeout=30)
         elif method == "PATCH":
-            response = requests.patch(url, headers=headers, json=data, timeout=30)
+            response = requests.patch(url, headers=request_headers, json=data, timeout=30)
         else:
             error_msg = f"Unsupported HTTP method: {method}"
             logger.error(error_msg)
             return {"error": error_msg}
         
+        # Handle 404 responses gracefully
+        if response.status_code == 404:
+            # For some endpoints, 404 means "no data" not an error
+            if endpoint.endswith("/templates") or "templates" in endpoint:
+                return {"templates": [], "message": "No templates found"}
+            # Return empty result for other 404s
+            return {"error": "Resource not found", "status_code": 404}
+        
         response.raise_for_status()
         return response.json() if response.text else {}
-    except requests.exceptions.RequestException as e:
+    except requests.exceptions.HTTPError as e:
         error_message = f"Error: {str(e)}"
+        status_code = None
         try:
             if hasattr(e, 'response') and e.response is not None:
+                status_code = e.response.status_code
                 error_data = e.response.json()
                 if isinstance(error_data, dict):
-                    error_message = f"Error: {error_data.get('errors', [e.response.reason])[0]}"
+                    errors = error_data.get('errors', [])
+                    if errors:
+                        if isinstance(errors, list):
+                            error_message = f"Error: {errors[0]}"
+                        else:
+                            error_message = f"Error: {errors}"
+                    elif 'error' in error_data:
+                        error_message = f"Error: {error_data['error']}"
+                    elif 'message' in error_data:
+                        error_message = f"Error: {error_data['message']}"
+                    else:
+                        error_message = f"Error: {e.response.reason}"
         except Exception:
             pass
+        
+        # Provide more context for authorization errors
+        if status_code == 401 or status_code == 403:
+            auth_type = "Organization API Key" if use_org_key else "App REST API Key"
+            error_message = (
+                f"Authorization failed ({auth_type}). "
+                f"Status: {status_code}. "
+                f"Details: {error_message}. "
+                f"Endpoint: {endpoint}"
+            )
+        
+        logger.error(f"API request failed: {error_message}")
+        return {"error": error_message, "status_code": status_code}
+    except requests.exceptions.RequestException as e:
+        error_message = f"Request failed: {str(e)}"
         logger.error(f"API request failed: {error_message}")
         return {"error": error_message}
     except Exception as e:
@@ -410,7 +459,7 @@ async def switch_app(key: str) -> str:
 # === Message Management Tools ===
 
 @mcp.tool()
-async def send_push_notification(title: str, message: str, segments: List[str] = None, external_ids: List[str] = None, data: Dict[str, Any] = None) -> Dict[str, Any]:
+async def send_push_notification(title: str, message: str, segments: List[str] = None, external_ids: List[str] = None, data: Dict[str, Any] = None, idempotency_key: str = None) -> Dict[str, Any]:
     """Send a new push notification through OneSignal.
     
     Args:
@@ -419,6 +468,7 @@ async def send_push_notification(title: str, message: str, segments: List[str] =
         segments: List of segments to include (e.g., ["Subscribed Users"]).
         external_ids: List of external user IDs to target.
         data: Additional data to include with the notification (optional).
+        idempotency_key: Optional idempotency key to prevent duplicate messages (up to 64 alphanumeric characters).
     """
     app_config = get_current_app()
     if not app_config:
@@ -444,7 +494,12 @@ async def send_push_notification(title: str, message: str, segments: List[str] =
         notification_data["data"] = data
     
     # This endpoint uses app-specific REST API Key
-    result = await make_onesignal_request("notifications", method="POST", data=notification_data, use_org_key=False)
+    # Add idempotency_key to headers if provided
+    extra_headers = {}
+    if idempotency_key:
+        extra_headers["Idempotency-Key"] = idempotency_key
+    
+    result = await make_onesignal_request("notifications", method="POST", data=notification_data, use_org_key=False, headers=extra_headers if extra_headers else None)
     
     return result
 
@@ -578,6 +633,10 @@ async def create_segment(name: str, filters: str) -> str:
         filters: JSON string representing the filters for this segment
                (e.g., '[{"field":"tag","key":"level","relation":"=","value":"10"}]')
     """
+    app_config = get_current_app()
+    if not app_config:
+        return "No app currently selected. Use switch_app to select an app."
+    
     try:
         parsed_filters = json.loads(filters)
     except json.JSONDecodeError:
@@ -588,8 +647,8 @@ async def create_segment(name: str, filters: str) -> str:
         "filters": parsed_filters
     }
     
-    endpoint = f"apps/{get_current_app().app_id}/segments"
-    result = await make_onesignal_request(endpoint, method="POST", data=data)
+    endpoint = f"apps/{app_config.app_id}/segments"
+    result = await make_onesignal_request(endpoint, method="POST", data=data, use_org_key=False)
     
     if "error" in result:
         return f"Error creating segment: {result['error']}"
@@ -603,8 +662,14 @@ async def delete_segment(segment_id: str) -> str:
     Args:
         segment_id: ID of the segment to delete
     """
-    endpoint = f"apps/{get_current_app().app_id}/segments/{segment_id}"
-    result = await make_onesignal_request(endpoint, method="DELETE")
+    app_config = get_current_app()
+    if not app_config:
+        return "No app currently selected. Use switch_app to select an app."
+    
+    # Segments use apps/{app_id}/segments/{segment_id} format
+    # app_id is already in the URL path, so no need for params
+    endpoint = f"apps/{app_config.app_id}/segments/{segment_id}"
+    result = await make_onesignal_request(endpoint, method="DELETE", use_org_key=False)
     
     if "error" in result:
         return f"Error deleting segment: {result['error']}"
@@ -620,14 +685,23 @@ async def view_templates() -> str:
     if not app_config:
         return "No app currently selected. Use switch_app to select an app."
     
-    # This endpoint requires app_id in the URL path
-    endpoint = f"apps/{app_config.app_id}/templates"
+    # OneSignal API uses /templates endpoint with app_id as query parameter
+    # The make_onesignal_request function will automatically add app_id to params
+    # since the endpoint doesn't start with "apps/"
+    endpoint = "templates"
     result = await make_onesignal_request(endpoint, method="GET", use_org_key=False)
     
     if "error" in result:
+        # Check if it's a 404 (no templates)
+        if result.get("status_code") == 404 or "not found" in result.get("error", "").lower():
+            return "No templates found."
         return f"Error retrieving templates: {result['error']}"
     
-    templates = result.get("templates", [])
+    # Handle both direct array response and wrapped response
+    if isinstance(result, list):
+        templates = result
+    else:
+        templates = result.get("templates", [])
     
     if not templates:
         return "No templates found."
@@ -649,24 +723,72 @@ async def view_template_details(template_id: str) -> str:
     Args:
         template_id: The ID of the template to retrieve details for
     """
-    params = {"app_id": get_current_app().app_id}
-    result = await make_onesignal_request(f"templates/{template_id}", method="GET", params=params)
+    app_config = get_current_app()
+    if not app_config:
+        return "No app currently selected. Use switch_app to select an app."
+    
+    # OneSignal API uses GET /templates/{template_id} with app_id as query parameter
+    # The make_onesignal_request function will automatically add app_id to params
+    # since the endpoint doesn't start with "apps/"
+    endpoint = f"templates/{template_id}"
+    result = await make_onesignal_request(endpoint, method="GET", use_org_key=False)
     
     if "error" in result:
         return f"Error fetching template details: {result['error']}"
     
-    # Format the template details in a readable way
-    heading = result.get("headings", {}).get("en", "No heading") if isinstance(result.get("headings"), dict) else "No heading"
-    content = result.get("contents", {}).get("en", "No content") if isinstance(result.get("contents"), dict) else "No content"
+    # Helper function to extract text from headings/contents
+    def extract_text(field_value, default="No value"):
+        """Extract text from headings or contents field, handling various formats."""
+        if field_value is None:
+            return default
+        
+        if isinstance(field_value, str):
+            return field_value.strip() if field_value.strip() else default
+        
+        if isinstance(field_value, dict):
+            # Try common language keys in order of preference
+            for lang_key in ["en", "en-US", "en_US", "default"]:
+                if lang_key in field_value:
+                    value = field_value[lang_key]
+                    if value and isinstance(value, str) and value.strip():
+                        return value.strip()
+                    elif value:  # Non-string value
+                        return str(value)
+            
+            # If no common key found, try first non-empty value
+            for key, value in field_value.items():
+                if value:
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+                    elif value:
+                        return str(value)
+        
+        return default
+    
+    # Handle headings - check both top-level and nested structures
+    headings = result.get("headings") or result.get("content", {}).get("headings")
+    heading = extract_text(headings, "No heading")
+    
+    # Handle contents - check both top-level and nested structures
+    contents = result.get("contents") or result.get("content", {}).get("contents")
+    content = extract_text(contents, "No content")
     
     details = [
-        f"ID: {result.get('id')}",
-        f"Name: {result.get('name')}",
+        f"ID: {result.get('id', 'N/A')}",
+        f"Name: {result.get('name', 'N/A')}",
         f"Title: {heading}",
         f"Message: {content}",
-        f"Platform: {result.get('platform')}",
-        f"Created: {result.get('created_at')}"
     ]
+    
+    # Add optional fields if present
+    if result.get('platform'):
+        details.append(f"Platform: {result.get('platform')}")
+    if result.get('created_at'):
+        details.append(f"Created: {result.get('created_at')}")
+    if result.get('updated_at'):
+        details.append(f"Updated: {result.get('updated_at')}")
+    if result.get('template_type'):
+        details.append(f"Type: {result.get('template_type')}")
     
     return "\n".join(details)
 
@@ -683,15 +805,16 @@ async def create_template(name: str, title: str, message: str) -> str:
     if not app_config:
         return "No app currently selected. Use switch_app to select an app."
     
+    # OneSignal API uses POST /templates endpoint with app_id in request body
     data = {
+        "app_id": app_config.app_id,
         "name": name,
         "headings": {"en": title},
         "contents": {"en": message}
     }
     
-    # This endpoint requires app_id in the URL path
-    endpoint = f"apps/{app_config.app_id}/templates"
-    result = await make_onesignal_request(endpoint, method="POST", data=data)
+    endpoint = "templates"
+    result = await make_onesignal_request(endpoint, method="POST", data=data, use_org_key=False)
     
     if "error" in result:
         return f"Error creating template: {result['error']}"
@@ -817,10 +940,11 @@ async def view_app_api_keys(app_id: str) -> str:
     Args:
         app_id: The ID of the app to retrieve API keys for
     """
-    result = await make_onesignal_request(f"apps/{app_id}/auth/tokens", use_org_key=True)
+    result = await make_onesignal_request(f"apps/{app_id}/auth/tokens", method="GET", use_org_key=True)
     
     if "error" in result:
-        if "401" in str(result["error"]) or "403" in str(result["error"]):
+        status_code = result.get("status_code")
+        if status_code == 401 or status_code == 403:
             return ("Error: Your Organization API Key is either not configured or doesn't have permission to view API keys. "
                    "Make sure you've set the ONESIGNAL_ORG_API_KEY environment variable with a valid Organization API Key.")
         return f"Error fetching API keys: {result['error']}"
@@ -886,7 +1010,10 @@ async def create_user(name: str = None, email: str = None, external_id: str = No
     if not app_config:
         return {"error": "No app currently selected. Use switch_app to select an app."}
     
-    data = {}
+    # Explicitly include app_id in request body for consistency
+    data = {
+        "app_id": app_config.app_id
+    }
     if name:
         data["name"] = name
     if email:
@@ -896,7 +1023,7 @@ async def create_user(name: str = None, email: str = None, external_id: str = No
     if tags:
         data["tags"] = tags
     
-    result = await make_onesignal_request("users", method="POST", data=data)
+    result = await make_onesignal_request("users", method="POST", data=data, use_org_key=False)
     return result
 
 @mcp.tool()
@@ -910,7 +1037,7 @@ async def view_user(user_id: str) -> Dict[str, Any]:
     if not app_config:
         return {"error": "No app currently selected. Use switch_app to select an app."}
     
-    result = await make_onesignal_request(f"users/{user_id}", method="GET")
+    result = await make_onesignal_request(f"users/{user_id}", method="GET", use_org_key=False)
     return result
 
 @mcp.tool()
@@ -927,7 +1054,10 @@ async def update_user(user_id: str, name: str = None, email: str = None, tags: D
     if not app_config:
         return {"error": "No app currently selected. Use switch_app to select an app."}
     
-    data = {}
+    # Explicitly include app_id in request body for consistency
+    data = {
+        "app_id": app_config.app_id
+    }
     if name:
         data["name"] = name
     if email:
@@ -935,10 +1065,11 @@ async def update_user(user_id: str, name: str = None, email: str = None, tags: D
     if tags:
         data["tags"] = tags
     
-    if not data:
+    # Check if there are any update parameters besides app_id
+    if len(data) == 1:  # Only app_id present
         return {"error": "No update parameters provided"}
     
-    result = await make_onesignal_request(f"users/{user_id}", method="PATCH", data=data)
+    result = await make_onesignal_request(f"users/{user_id}", method="PATCH", data=data, use_org_key=False)
     return result
 
 @mcp.tool()
@@ -952,7 +1083,7 @@ async def delete_user(user_id: str) -> Dict[str, Any]:
     if not app_config:
         return {"error": "No app currently selected. Use switch_app to select an app."}
     
-    result = await make_onesignal_request(f"users/{user_id}", method="DELETE")
+    result = await make_onesignal_request(f"users/{user_id}", method="DELETE", use_org_key=False)
     return result
 
 @mcp.tool()
@@ -966,7 +1097,7 @@ async def view_user_identity(user_id: str) -> Dict[str, Any]:
     if not app_config:
         return {"error": "No app currently selected. Use switch_app to select an app."}
     
-    result = await make_onesignal_request(f"users/{user_id}/identity", method="GET")
+    result = await make_onesignal_request(f"users/{user_id}/identity", method="GET", use_org_key=False)
     return result
 
 @mcp.tool()
@@ -982,13 +1113,15 @@ async def create_or_update_alias(user_id: str, alias_label: str, alias_id: str) 
     if not app_config:
         return {"error": "No app currently selected. Use switch_app to select an app."}
     
+    # Explicitly include app_id in request body for consistency
     data = {
+        "app_id": app_config.app_id,
         "alias": {
             alias_label: alias_id
         }
     }
     
-    result = await make_onesignal_request(f"users/{user_id}/identity", method="PATCH", data=data)
+    result = await make_onesignal_request(f"users/{user_id}/identity", method="PATCH", data=data, use_org_key=False)
     return result
 
 @mcp.tool()
@@ -1003,7 +1136,7 @@ async def delete_alias(user_id: str, alias_label: str) -> Dict[str, Any]:
     if not app_config:
         return {"error": "No app currently selected. Use switch_app to select an app."}
     
-    result = await make_onesignal_request(f"users/{user_id}/identity/{alias_label}", method="DELETE")
+    result = await make_onesignal_request(f"users/{user_id}/identity/{alias_label}", method="DELETE", use_org_key=False)
     return result
 
 # === Subscription Management Tools ===
@@ -1021,14 +1154,16 @@ async def create_subscription(user_id: str, subscription_type: str, identifier: 
     if not app_config:
         return {"error": "No app currently selected. Use switch_app to select an app."}
     
+    # Explicitly include app_id in request body for consistency
     data = {
+        "app_id": app_config.app_id,
         "subscription": {
             "type": subscription_type,
             "identifier": identifier
         }
     }
     
-    result = await make_onesignal_request(f"users/{user_id}/subscriptions", method="POST", data=data)
+    result = await make_onesignal_request(f"users/{user_id}/subscriptions", method="POST", data=data, use_org_key=False)
     return result
 
 @mcp.tool()
@@ -1044,11 +1179,14 @@ async def update_subscription(user_id: str, subscription_id: str, enabled: bool 
     if not app_config:
         return {"error": "No app currently selected. Use switch_app to select an app."}
     
-    data = {}
+    # Explicitly include app_id in request body for consistency
+    data = {
+        "app_id": app_config.app_id
+    }
     if enabled is not None:
         data["enabled"] = enabled
     
-    result = await make_onesignal_request(f"users/{user_id}/subscriptions/{subscription_id}", method="PATCH", data=data)
+    result = await make_onesignal_request(f"users/{user_id}/subscriptions/{subscription_id}", method="PATCH", data=data, use_org_key=False)
     return result
 
 @mcp.tool()
@@ -1063,7 +1201,7 @@ async def delete_subscription(user_id: str, subscription_id: str) -> Dict[str, A
     if not app_config:
         return {"error": "No app currently selected. Use switch_app to select an app."}
     
-    result = await make_onesignal_request(f"users/{user_id}/subscriptions/{subscription_id}", method="DELETE")
+    result = await make_onesignal_request(f"users/{user_id}/subscriptions/{subscription_id}", method="DELETE", use_org_key=False)
     return result
 
 @mcp.tool()
@@ -1079,11 +1217,13 @@ async def transfer_subscription(user_id: str, subscription_id: str, new_user_id:
     if not app_config:
         return {"error": "No app currently selected. Use switch_app to select an app."}
     
+    # Explicitly include app_id in request body for consistency
     data = {
+        "app_id": app_config.app_id,
         "new_user_id": new_user_id
     }
     
-    result = await make_onesignal_request(f"users/{user_id}/subscriptions/{subscription_id}/transfer", method="PATCH", data=data)
+    result = await make_onesignal_request(f"users/{user_id}/subscriptions/{subscription_id}/transfer", method="PATCH", data=data, use_org_key=False)
     return result
 
 @mcp.tool()
@@ -1101,7 +1241,88 @@ async def unsubscribe_email(token: str) -> Dict[str, Any]:
         "token": token
     }
     
-    result = await make_onesignal_request("email/unsubscribe", method="POST", data=data)
+    result = await make_onesignal_request("email/unsubscribe", method="POST", data=data, use_org_key=False)
+    return result
+
+@mcp.tool()
+async def view_subscription_by_token(subscription_token: str) -> Dict[str, Any]:
+    """View subscription details by subscription token.
+    
+    Args:
+        subscription_token: The subscription token to retrieve details for
+    """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    result = await make_onesignal_request(f"subscriptions/{subscription_token}", method="GET", use_org_key=False)
+    return result
+
+@mcp.tool()
+async def update_subscription_by_token(subscription_token: str, enabled: bool = None) -> Dict[str, Any]:
+    """Update a subscription by subscription token.
+    
+    Args:
+        subscription_token: The subscription token to update
+        enabled: Whether the subscription should be enabled or disabled (optional)
+    """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    # Explicitly include app_id in request body for consistency
+    data = {
+        "app_id": app_config.app_id
+    }
+    if enabled is not None:
+        data["enabled"] = enabled
+    
+    # Check if there are any update parameters besides app_id
+    if len(data) == 1:  # Only app_id present
+        return {"error": "No update parameters provided"}
+    
+    result = await make_onesignal_request(f"subscriptions/{subscription_token}", method="PATCH", data=data, use_org_key=False)
+    return result
+
+@mcp.tool()
+async def view_user_identity_by_subscription(subscription_id: str) -> Dict[str, Any]:
+    """View user identity information by subscription ID.
+    
+    Args:
+        subscription_id: The subscription ID to retrieve identity for
+    """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    endpoint = f"apps/{app_config.app_id}/subscriptions/{subscription_id}/identity"
+    result = await make_onesignal_request(endpoint, method="GET", use_org_key=False)
+    return result
+
+@mcp.tool()
+async def create_alias_by_subscription(subscription_id: str, alias_label: str, alias_id: str) -> Dict[str, Any]:
+    """Create or update a user alias by subscription ID.
+    
+    Args:
+        subscription_id: The subscription ID
+        alias_label: The type/label of the alias (e.g., "email", "phone", "external")
+        alias_id: The alias identifier value
+    """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    # Explicitly include app_id in request body for consistency
+    # Note: app_id is also in URL path, but including in body for consistency
+    data = {
+        "app_id": app_config.app_id,
+        "alias": {
+            alias_label: alias_id
+        }
+    }
+    
+    endpoint = f"apps/{app_config.app_id}/subscriptions/{subscription_id}/identity"
+    result = await make_onesignal_request(endpoint, method="PATCH", data=data, use_org_key=False)
     return result
 
 # === NEW: Email & SMS Messaging Tools ===
@@ -1109,7 +1330,8 @@ async def unsubscribe_email(token: str) -> Dict[str, Any]:
 @mcp.tool()
 async def send_email(subject: str, body: str, email_body: str = None, 
                      include_emails: List[str] = None, segments: List[str] = None,
-                     external_ids: List[str] = None, template_id: str = None) -> Dict[str, Any]:
+                     external_ids: List[str] = None, template_id: str = None,
+                     idempotency_key: str = None) -> Dict[str, Any]:
     """Send an email through OneSignal.
     
     Args:
@@ -1120,6 +1342,7 @@ async def send_email(subject: str, body: str, email_body: str = None,
         segments: List of segments to include
         external_ids: List of external user IDs to target
         template_id: Email template ID to use
+        idempotency_key: Optional idempotency key to prevent duplicate messages (up to 64 alphanumeric characters)
     """
     app_config = get_current_app()
     if not app_config:
@@ -1145,13 +1368,17 @@ async def send_email(subject: str, body: str, email_body: str = None,
     if template_id:
         email_data["template_id"] = template_id
     
-    result = await make_onesignal_request("notifications", method="POST", data=email_data)
+    extra_headers = {}
+    if idempotency_key:
+        extra_headers["Idempotency-Key"] = idempotency_key
+    
+    result = await make_onesignal_request("notifications", method="POST", data=email_data, use_org_key=False, headers=extra_headers if extra_headers else None)
     return result
 
 @mcp.tool()
 async def send_sms(message: str, phone_numbers: List[str] = None, 
                    segments: List[str] = None, external_ids: List[str] = None,
-                   media_url: str = None) -> Dict[str, Any]:
+                   media_url: str = None, idempotency_key: str = None) -> Dict[str, Any]:
     """Send an SMS/MMS through OneSignal.
     
     Args:
@@ -1160,6 +1387,7 @@ async def send_sms(message: str, phone_numbers: List[str] = None,
         segments: List of segments to include
         external_ids: List of external user IDs to target
         media_url: URL for MMS media attachment
+        idempotency_key: Optional idempotency key to prevent duplicate messages (up to 64 alphanumeric characters)
     """
     app_config = get_current_app()
     if not app_config:
@@ -1183,13 +1411,18 @@ async def send_sms(message: str, phone_numbers: List[str] = None,
     if media_url:
         sms_data["mms_media_url"] = media_url
     
-    result = await make_onesignal_request("notifications", method="POST", data=sms_data)
+    extra_headers = {}
+    if idempotency_key:
+        extra_headers["Idempotency-Key"] = idempotency_key
+    
+    result = await make_onesignal_request("notifications", method="POST", data=sms_data, use_org_key=False, headers=extra_headers if extra_headers else None)
     return result
 
 @mcp.tool()
 async def send_transactional_message(channel: str, content: Dict[str, str], 
                                    recipients: Dict[str, Any], template_id: str = None,
-                                   custom_data: Dict[str, Any] = None) -> Dict[str, Any]:
+                                   custom_data: Dict[str, Any] = None,
+                                   idempotency_key: str = None) -> Dict[str, Any]:
     """Send a transactional message (immediate delivery, no scheduling).
     
     Args:
@@ -1198,6 +1431,7 @@ async def send_transactional_message(channel: str, content: Dict[str, str],
         recipients: Targeting information (include_external_user_ids, include_emails, etc.)
         template_id: Template ID to use
         custom_data: Custom data to include
+        idempotency_key: Optional idempotency key to prevent duplicate messages (up to 64 alphanumeric characters)
     """
     app_config = get_current_app()
     if not app_config:
@@ -1225,7 +1459,11 @@ async def send_transactional_message(channel: str, content: Dict[str, str],
     if custom_data:
         message_data["data"] = custom_data
     
-    result = await make_onesignal_request("notifications", method="POST", data=message_data)
+    extra_headers = {}
+    if idempotency_key:
+        extra_headers["Idempotency-Key"] = idempotency_key
+    
+    result = await make_onesignal_request("notifications", method="POST", data=message_data, use_org_key=False, headers=extra_headers if extra_headers else None)
     return result
 
 # === NEW: Enhanced Template Management ===
@@ -1241,7 +1479,13 @@ async def update_template(template_id: str, name: str = None,
         title: New title/heading for the template
         message: New content/message for the template
     """
-    data = {}
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    data = {
+        "app_id": app_config.app_id
+    }
     
     if name:
         data["name"] = name
@@ -1250,11 +1494,14 @@ async def update_template(template_id: str, name: str = None,
     if message:
         data["contents"] = {"en": message}
     
-    if not data:
+    # Check if there are any update parameters besides app_id
+    if len(data) == 1:  # Only app_id present
         return {"error": "No update parameters provided"}
     
-    result = await make_onesignal_request(f"templates/{template_id}", 
-                                        method="PATCH", data=data)
+    # OneSignal API uses PATCH /templates/{template_id} with app_id in request body
+    endpoint = f"templates/{template_id}"
+    result = await make_onesignal_request(endpoint, method="PATCH", data=data, use_org_key=False)
+    
     return result
 
 @mcp.tool()
@@ -1264,8 +1511,16 @@ async def delete_template(template_id: str) -> Dict[str, Any]:
     Args:
         template_id: ID of the template to delete
     """
-    result = await make_onesignal_request(f"templates/{template_id}", 
-                                        method="DELETE")
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    # OneSignal API uses DELETE /templates/{template_id} with app_id as query parameter
+    # Explicitly add app_id to params to ensure it's included
+    endpoint = f"templates/{template_id}"
+    params = {"app_id": app_config.app_id}
+    result = await make_onesignal_request(endpoint, method="DELETE", params=params, use_org_key=False)
+    
     if "error" not in result:
         return {"success": f"Template '{template_id}' deleted successfully"}
     return result
@@ -1280,13 +1535,20 @@ async def copy_template_to_app(template_id: str, target_app_id: str,
         target_app_id: ID of the app to copy the template to
         new_name: Optional new name for the copied template
     """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    # OneSignal API uses POST /templates/{template_id}/copy
+    # The target app_id is included in the request body
     data = {"app_id": target_app_id}
     
     if new_name:
         data["name"] = new_name
     
-    result = await make_onesignal_request(f"templates/{template_id}/copy",
-                                        method="POST", data=data)
+    endpoint = f"templates/{template_id}/copy"
+    result = await make_onesignal_request(endpoint, method="POST", data=data, use_org_key=False)
+    
     return result
 
 # === NEW: Live Activities (iOS) ===
@@ -1304,7 +1566,13 @@ async def start_live_activity(activity_id: str, push_token: str,
         activity_attributes: Static attributes for the activity
         content_state: Initial dynamic content state
     """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    # Explicitly include app_id in request body for consistency
     data = {
+        "app_id": app_config.app_id,
         "activity_id": activity_id,
         "push_token": push_token,
         "subscription_id": subscription_id,
@@ -1313,7 +1581,7 @@ async def start_live_activity(activity_id: str, push_token: str,
     }
     
     result = await make_onesignal_request(f"live_activities/{activity_id}/start",
-                                        method="POST", data=data)
+                                        method="POST", data=data, use_org_key=False)
     return result
 
 @mcp.tool()
@@ -1332,7 +1600,13 @@ async def update_live_activity(activity_id: str, name: str, event: str,
         priority: Notification priority (5-10)
         sound: Sound file name for the update
     """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    # Explicitly include app_id in request body for consistency
     data = {
+        "app_id": app_config.app_id,
         "name": name,
         "event": event,
         "content_state": content_state
@@ -1346,7 +1620,7 @@ async def update_live_activity(activity_id: str, name: str, event: str,
         data["sound"] = sound
     
     result = await make_onesignal_request(f"live_activities/{activity_id}/update",
-                                        method="POST", data=data)
+                                        method="POST", data=data, use_org_key=False)
     return result
 
 @mcp.tool()
@@ -1360,7 +1634,13 @@ async def end_live_activity(activity_id: str, subscription_id: str,
         dismissal_date: Unix timestamp for dismissal
         priority: Notification priority (5-10)
     """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    # Explicitly include app_id in request body for consistency
     data = {
+        "app_id": app_config.app_id,
         "subscription_id": subscription_id,
         "event": "end"
     }
@@ -1371,7 +1651,7 @@ async def end_live_activity(activity_id: str, subscription_id: str,
         data["priority"] = priority
     
     result = await make_onesignal_request(f"live_activities/{activity_id}/end",
-                                        method="POST", data=data)
+                                        method="POST", data=data, use_org_key=False)
     return result
 
 # === NEW: Analytics & Outcomes ===
@@ -1402,7 +1682,7 @@ async def view_outcomes(outcome_names: List[str], outcome_time_range: str = None
         params["outcome_attribution"] = outcome_attribution
     
     result = await make_onesignal_request(f"apps/{app_config.app_id}/outcomes",
-                                        method="GET", params=params)
+                                        method="GET", params=params, use_org_key=False)
     return result
 
 # === NEW: Export Functions ===
@@ -1410,7 +1690,7 @@ async def view_outcomes(outcome_names: List[str], outcome_time_range: str = None
 @mcp.tool()
 async def export_messages_csv(start_date: str = None, end_date: str = None,
                              event_types: List[str] = None) -> Dict[str, Any]:
-    """Export messages/notifications data to CSV.
+    """Export messages/notifications data to CSV (requires Organization API Key).
     
     Args:
         start_date: Start date for export (ISO 8601 format)
@@ -1428,6 +1708,250 @@ async def export_messages_csv(start_date: str = None, end_date: str = None,
     
     result = await make_onesignal_request("notifications/csv_export",
                                         method="POST", data=data, use_org_key=True)
+    return result
+
+@mcp.tool()
+async def export_subscriptions_csv(start_date: str = None, end_date: str = None,
+                                  segment_names: List[str] = None) -> Dict[str, Any]:
+    """Export subscriptions/players data to CSV (requires Organization API Key).
+    
+    Args:
+        start_date: Start date for export (ISO 8601 format)
+        end_date: End date for export (ISO 8601 format)
+        segment_names: List of segment names to filter by
+    """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    data = {}
+    
+    if start_date:
+        data["start_date"] = start_date
+    if end_date:
+        data["end_date"] = end_date
+    if segment_names:
+        data["segment_names"] = segment_names
+    
+    result = await make_onesignal_request(f"apps/{app_config.app_id}/players/csv_export",
+                                        method="POST", data=data, use_org_key=True)
+    return result
+
+# === NEW: Player/Device Management (Legacy) ===
+
+@mcp.tool()
+async def view_players(limit: int = 50, offset: int = 0) -> Dict[str, Any]:
+    """View players/devices subscribed to your OneSignal app (legacy API).
+    
+    Args:
+        limit: Maximum number of players to return (default: 50, max: 300)
+        offset: Result offset for pagination (default: 0)
+    """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    params = {
+        "app_id": app_config.app_id,
+        "limit": min(limit, 300),
+        "offset": offset
+    }
+    
+    result = await make_onesignal_request("players", method="GET", params=params, use_org_key=False)
+    return result
+
+@mcp.tool()
+async def view_player_details(player_id: str) -> Dict[str, Any]:
+    """Get detailed information about a specific player/device (legacy API).
+    
+    Args:
+        player_id: The player ID to retrieve details for
+    """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    params = {"app_id": app_config.app_id}
+    result = await make_onesignal_request(f"players/{player_id}", method="GET", params=params, use_org_key=False)
+    return result
+
+@mcp.tool()
+async def add_player(device_type: int, identifier: str = None, 
+                    language: str = None, timezone: int = None,
+                    game_version: str = None, device_model: str = None,
+                    device_os: str = None, ad_id: str = None,
+                    sdk: str = None, session_count: int = None,
+                    tags: Dict[str, str] = None, amount_spent: float = None,
+                    created_at: int = None, last_active: int = None,
+                    playtime: int = None, badge_count: int = None,
+                    external_user_id: str = None) -> Dict[str, Any]:
+    """Add a new player/device to your OneSignal app (legacy API).
+    
+    Args:
+        device_type: Device type (0=iOS, 1=Android, 2=Amazon, 3=WindowsPhone, 4=Chrome, 5=ChromeWeb, 6=Windows, 7=Mac, 8=AmazonFire, 9=Safari, 10=Firefox, 11=Opera, 12=Edge)
+        identifier: Push notification identifier (required for push)
+        language: Language code (e.g., "en")
+        timezone: Timezone offset in seconds
+        game_version: Game version string
+        device_model: Device model name
+        device_os: Device OS version
+        ad_id: Advertising ID
+        sdk: SDK version
+        session_count: Number of sessions
+        tags: Custom tags
+        amount_spent: Total amount spent
+        created_at: Unix timestamp when created
+        last_active: Unix timestamp of last activity
+        playtime: Total playtime in seconds
+        badge_count: Badge count
+        external_user_id: External user ID
+    """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    data = {
+        "app_id": app_config.app_id,
+        "device_type": device_type
+    }
+    
+    if identifier:
+        data["identifier"] = identifier
+    if language:
+        data["language"] = language
+    if timezone is not None:
+        data["timezone"] = timezone
+    if game_version:
+        data["game_version"] = game_version
+    if device_model:
+        data["device_model"] = device_model
+    if device_os:
+        data["device_os"] = device_os
+    if ad_id:
+        data["ad_id"] = ad_id
+    if sdk:
+        data["sdk"] = sdk
+    if session_count is not None:
+        data["session_count"] = session_count
+    if tags:
+        data["tags"] = tags
+    if amount_spent is not None:
+        data["amount_spent"] = amount_spent
+    if created_at is not None:
+        data["created_at"] = created_at
+    if last_active is not None:
+        data["last_active"] = last_active
+    if playtime is not None:
+        data["playtime"] = playtime
+    if badge_count is not None:
+        data["badge_count"] = badge_count
+    if external_user_id:
+        data["external_user_id"] = external_user_id
+    
+    result = await make_onesignal_request("players", method="POST", data=data, use_org_key=False)
+    return result
+
+@mcp.tool()
+async def edit_player(player_id: str, language: str = None,
+                     timezone: int = None, game_version: str = None,
+                     device_model: str = None, device_os: str = None,
+                     ad_id: str = None, sdk: str = None,
+                     session_count: int = None, tags: Dict[str, str] = None,
+                     amount_spent: float = None, last_active: int = None,
+                     playtime: int = None, badge_count: int = None,
+                     external_user_id: str = None) -> Dict[str, Any]:
+    """Edit an existing player/device (legacy API).
+    
+    Args:
+        player_id: The player ID to update
+        language: Language code
+        timezone: Timezone offset in seconds
+        game_version: Game version string
+        device_model: Device model name
+        device_os: Device OS version
+        ad_id: Advertising ID
+        sdk: SDK version
+        session_count: Number of sessions
+        tags: Custom tags
+        amount_spent: Total amount spent
+        last_active: Unix timestamp of last activity
+        playtime: Total playtime in seconds
+        badge_count: Badge count
+        external_user_id: External user ID
+    """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    data = {
+        "app_id": app_config.app_id
+    }
+    
+    if language:
+        data["language"] = language
+    if timezone is not None:
+        data["timezone"] = timezone
+    if game_version:
+        data["game_version"] = game_version
+    if device_model:
+        data["device_model"] = device_model
+    if device_os:
+        data["device_os"] = device_os
+    if ad_id:
+        data["ad_id"] = ad_id
+    if sdk:
+        data["sdk"] = sdk
+    if session_count is not None:
+        data["session_count"] = session_count
+    if tags:
+        data["tags"] = tags
+    if amount_spent is not None:
+        data["amount_spent"] = amount_spent
+    if last_active is not None:
+        data["last_active"] = last_active
+    if playtime is not None:
+        data["playtime"] = playtime
+    if badge_count is not None:
+        data["badge_count"] = badge_count
+    if external_user_id:
+        data["external_user_id"] = external_user_id
+    
+    result = await make_onesignal_request(f"players/{player_id}", method="PUT", data=data, use_org_key=False)
+    return result
+
+@mcp.tool()
+async def delete_player(player_id: str) -> Dict[str, Any]:
+    """Delete a player/device record (legacy API).
+    
+    Args:
+        player_id: The player ID to delete
+    """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    params = {"app_id": app_config.app_id}
+    result = await make_onesignal_request(f"players/{player_id}", method="DELETE", params=params, use_org_key=False)
+    return result
+
+@mcp.tool()
+async def edit_tags_with_external_user_id(external_user_id: str, tags: Dict[str, str]) -> Dict[str, Any]:
+    """Edit tags for a user by external user ID (legacy API).
+    
+    Args:
+        external_user_id: External user ID
+        tags: Tags to update (use empty string value to remove a tag)
+    """
+    app_config = get_current_app()
+    if not app_config:
+        return {"error": "No app currently selected. Use switch_app to select an app."}
+    
+    data = {
+        "app_id": app_config.app_id,
+        "tags": tags
+    }
+    
+    result = await make_onesignal_request(f"users/{external_user_id}", method="PUT", data=data, use_org_key=False)
     return result
 
 # === NEW: API Key Management ===

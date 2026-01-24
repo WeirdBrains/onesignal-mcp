@@ -61,8 +61,8 @@ pip install onesignal-mcp
    ONESIGNAL_ORG_API_KEY=your_organization_api_key_here
    
    # Optional: Multiple app configurations
-   ONESIGNAL_MANDIBLE_APP_ID=mandible_app_id
-   ONESIGNAL_MANDIBLE_API_KEY=mandible_api_key
+   ONESIGNAL_AIBOOKCRAFT_APP_ID=aibookcraft_app_id
+   ONESIGNAL_AIBOOKCRAFT_API_KEY=aibookcraft_api_key
    
    ONESIGNAL_WEIRDBRAINS_APP_ID=weirdbrains_app_id
    ONESIGNAL_WEIRDBRAINS_API_KEY=weirdbrains_api_key
