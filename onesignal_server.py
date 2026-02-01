@@ -56,13 +56,13 @@ class AppConfig:
 app_configs: Dict[str, AppConfig] = {}
 
 # Load app configurations from environment variables
-# AIBookCraft app configuration
-aibookcraft_app_id = os.getenv("ONESIGNAL_AIBOOKCRAFT_APP_ID", "") or os.getenv("ONESIGNAL_APP_ID", "")
-aibookcraft_api_key = os.getenv("ONESIGNAL_AIBOOKCRAFT_API_KEY", "") or os.getenv("ONESIGNAL_API_KEY", "")
-if aibookcraft_app_id and aibookcraft_api_key:
-    app_configs["aibookcraft"] = AppConfig(aibookcraft_app_id, aibookcraft_api_key, "AIBookCraft")
-    current_app_key = "aibookcraft"
-    logger.info(f"AIBookCraft app configured with ID: {aibookcraft_app_id}")
+# Mandible app configuration
+mandible_app_id = os.getenv("ONESIGNAL_MANDIBLE_APP_ID", "") or os.getenv("ONESIGNAL_APP_ID", "")
+mandible_api_key = os.getenv("ONESIGNAL_MANDIBLE_API_KEY", "") or os.getenv("ONESIGNAL_API_KEY", "")
+if mandible_app_id and mandible_api_key:
+    app_configs["mandible"] = AppConfig(mandible_app_id, mandible_api_key, "Mandible")
+    current_app_key = "mandible"
+    logger.info(f"Mandible app configured with ID: {mandible_app_id}")
 
 # Weird Brains app configuration
 weirdbrains_app_id = os.getenv("ONESIGNAL_WEIRDBRAINS_APP_ID", "")
