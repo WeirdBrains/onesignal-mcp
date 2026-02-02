@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/weirdbrains-onesignal-mcp-badge.png)](https://mseep.ai/app/weirdbrains-onesignal-mcp)
+
 # OneSignal MCP Server
 
 A comprehensive Model Context Protocol (MCP) server for interacting with the OneSignal API. This server provides a complete interface for managing push notifications, emails, SMS, users, devices, segments, templates, analytics, and more through OneSignal's REST API.
